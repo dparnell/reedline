@@ -15,6 +15,19 @@ use {
     crossbeam::channel::TryRecvError,
     std::io::{Error, ErrorKind},
 };
+#[cfg(feature = "async")]
+use {
+    crossterm::event::EventStream,
+    futures::{
+        future::{
+            FutureExt,
+        },
+
+        StreamExt,
+        select
+    },
+    futures_timer::Delay
+};
 use {
     crate::{
         completion::{Completer, DefaultCompleter},
@@ -158,6 +171,8 @@ pub struct Reedline {
 
     #[cfg(feature = "external_printer")]
     external_printer: Option<ExternalPrinter<String>>,
+    #[cfg(feature = "async")]
+    event_stream: EventStream
 }
 
 struct BufferEditor {
@@ -230,6 +245,8 @@ impl Reedline {
             kitty_protocol: KittyProtocolGuard::default(),
             #[cfg(feature = "external_printer")]
             external_printer: None,
+            #[cfg(feature = "async")]
+            event_stream: EventStream::new()
         }
     }
 
@@ -626,16 +643,40 @@ impl Reedline {
     /// Returns a [`std::io::Result`] in which the `Err` type is [`std::io::Result`]
     /// and the `Ok` variant wraps a [`Signal`] which handles user inputs.
     pub fn read_line(&mut self, prompt: &dyn Prompt) -> Result<Signal> {
-        terminal::enable_raw_mode()?;
-        self.bracketed_paste.enter();
-        self.kitty_protocol.enter();
+        self.init_terminal()?;
 
         let result = self.read_line_helper(prompt);
 
+        self.deinit_terminal()?;
+        result
+    }
+
+    #[cfg(feature = "async")]
+    /// Wait for input and provide the user with a specified [`Prompt`].
+    ///
+    /// Returns a [`std::io::Result`] in which the `Err` type is [`std::io::Result`]
+    /// and the `Ok` variant wraps a [`Signal`] which handles user inputs.
+    pub async fn next_line(&mut self, prompt: &dyn Prompt) -> Result<Signal> {
+        self.init_terminal()?;
+
+        let result = self.read_line_async_helper(prompt).await;
+
+        self.deinit_terminal()?;
+        result
+    }
+
+    fn init_terminal(&mut self) -> Result<()> {
+        terminal::enable_raw_mode()?;
+        self.bracketed_paste.enter();
+        self.kitty_protocol.enter();
+        Ok(())
+    }
+
+    fn deinit_terminal(&mut self) -> Result<()> {
         self.bracketed_paste.exit();
         self.kitty_protocol.exit();
         terminal::disable_raw_mode()?;
-        result
+        Ok(())
     }
 
     /// Returns the current insertion point of the input buffer.
@@ -736,6 +777,142 @@ impl Reedline {
                 // pasting text, resizes, blocking this thread (e.g. during debugging)
                 // We should be able to handle all of them as quickly as possible without causing unnecessary output steps.
                 if !event::poll(Duration::from_millis(POLL_WAIT))? {
+                    break;
+                }
+            }
+
+            if let Some((x, y)) = latest_resize {
+                reedline_events.push(ReedlineEvent::Resize(x, y));
+            }
+
+            // Accelerate pasted text by fusing `EditCommand`s
+            //
+            // (Text should only be `EditCommand::InsertChar`s)
+            let mut last_edit_commands = None;
+            for event in crossterm_events.drain(..) {
+                match (&mut last_edit_commands, self.edit_mode.parse_event(event)) {
+                    (None, ReedlineEvent::Edit(ec)) => {
+                        last_edit_commands = Some(ec);
+                    }
+                    (None, other_event) => {
+                        reedline_events.push(other_event);
+                    }
+                    (Some(ref mut last_ecs), ReedlineEvent::Edit(ec)) => {
+                        last_ecs.extend(ec);
+                    }
+                    (ref mut a @ Some(_), other_event) => {
+                        reedline_events.push(ReedlineEvent::Edit(a.take().unwrap()));
+
+                        reedline_events.push(other_event);
+                    }
+                }
+            }
+            if let Some(ec) = last_edit_commands {
+                reedline_events.push(ReedlineEvent::Edit(ec));
+            }
+
+            for event in reedline_events.drain(..) {
+                match self.handle_event(prompt, event)? {
+                    EventStatus::Exits(signal) => {
+                        if !self.executing_host_command {
+                            // Move the cursor below the input area, for external commands or new read_line call
+                            self.painter.move_cursor_to_end()?;
+                        }
+                        return Ok(signal);
+                    }
+                    EventStatus::Handled => {
+                        if !paste_enter_state {
+                            self.repaint(prompt)?;
+                        }
+                    }
+                    EventStatus::Inapplicable => {
+                        // Nothing changed, no need to repaint
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "async")]
+    /// Helper implementing the logic for [`Reedline::read_line()`] to be wrapped
+    /// in a `raw_mode` context.
+    async fn read_line_async_helper(&mut self, prompt: &dyn Prompt) -> Result<Signal> {
+        if self.executing_host_command {
+            self.executing_host_command = false;
+        } else {
+            self.painter.initialize_prompt_position()?;
+            self.hide_hints = false;
+        }
+
+        self.repaint(prompt)?;
+
+        let mut crossterm_events: Vec<ReedlineRawEvent> = vec![];
+        let mut reedline_events: Vec<ReedlineEvent> = vec![];
+
+        loop {
+            let mut paste_enter_state = false;
+
+            #[cfg(feature = "external_printer")]
+            if let Some(ref external_printer) = self.external_printer {
+                // get messages from printer as crlf separated "lines"
+                let messages = Self::external_messages(external_printer)?;
+                if !messages.is_empty() {
+                    // print the message(s)
+                    self.painter.print_external_message(
+                        messages,
+                        self.editor.line_buffer(),
+                        prompt,
+                    )?;
+                    self.repaint(prompt)?;
+                }
+            }
+
+            let mut latest_resize = None;
+            loop {
+                let mut timeout = Delay::new(Duration::from_millis(POLL_WAIT)).fuse();
+                let mut event = self.event_stream.next().fuse();
+
+                let mut done = false;
+                select! {
+                    _ = timeout => done = true,
+                    maybe_event = event => {
+                            match maybe_event {
+                                Some(result) => {
+                                    match result? {
+                                        Event::Resize(x, y) => {
+                                            latest_resize = Some((x, y));
+                                        }
+                                        enter @ Event::Key(KeyEvent {
+                                            code: KeyCode::Enter,
+                                            modifiers: KeyModifiers::NONE,
+                                            ..
+                                        }) => {
+                                            let enter = ReedlineRawEvent::convert_from(enter);
+                                            if let Some(enter) = enter {
+                                                crossterm_events.push(enter);
+                                                // Break early to check if the input is complete and
+                                                // can be send to the hosting application. If
+                                                // multiple complete entries are submitted, events
+                                                // are still in the crossterm queue for us to
+                                                // process.
+                                                paste_enter_state = crossterm_events.len() > EVENTS_THRESHOLD;
+                                                done = true;
+                                            }
+                                        }
+                                        x => {
+                                            let raw_event = ReedlineRawEvent::convert_from(x);
+                                            if let Some(evt) = raw_event {
+                                                crossterm_events.push(evt);
+                                            }
+                                        }
+                                    }
+                                },
+                                None => done = true
+                            }
+                    }
+                }
+
+                if done {
                     break;
                 }
             }

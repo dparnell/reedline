@@ -32,12 +32,15 @@ strum_macros = "0.26"
 thiserror = "1.0.31"
 unicode-segmentation = "1.9.0"
 unicode-width = "0.1.9"
+futures = { version = "0.3", optional = true }
+futures-timer = { version = "3.0", optional = true }
 
 [dev-dependencies]
 gethostname = "0.4.0"
 pretty_assertions = "1.4.0"
 rstest = { version = "0.18.0", default-features = false }
 tempfile = "3.3.0"
+tokio = { version = "1.36.0", features = ["full"]}
 
 [features]
 bashisms = []
@@ -45,6 +48,11 @@ external_printer = ["crossbeam"]
 sqlite = ["rusqlite/bundled", "serde_json"]
 sqlite-dynlib = ["rusqlite", "serde_json"]
 system_clipboard = ["arboard"]
+async = ["crossterm/event-stream", "futures", "futures-timer"]
+
+[[example]]
+name = "async_tokio"
+required-features = ["async"]
 
 [[example]]
 name = "cwd_aware_hinter"
